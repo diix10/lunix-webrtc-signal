@@ -12,14 +12,18 @@ const httpServer = createServer(app);
 // =============================
 // Memory state
 // =============================
-const activeStreams = new Map(); 
+const activeStreams = new Map();
 // streamId -> { streamId, playerId, playerName, serverId, serverName, startTime }
 
-const fivemServers = new Map(); 
+const fivemServers = new Map();
 // serverId -> socket
 
+function log(...args) {
+  console.log("[Lunix RTC]", ...args);
+}
+
 // =============================
-// Health routes
+// HTTP routes
 // =============================
 app.get("/", (_req, res) => {
   res.status(200).send("Lunix WebRTC Signal OK");
@@ -29,16 +33,123 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     serversConnected: fivemServers.size,
-    activeStreams: activeStreams.size
+    activeStreams: activeStreams.size,
   });
 });
 
-// optional debugging
-app.get("/sessions", (_req, res) => {
+app.get("/api/webrtc/sessions", (req, res) => {
+  const serverId = String(req.query.serverId || "");
+  let sessions = Array.from(activeStreams.values());
+
+  if (serverId) {
+    sessions = sessions.filter((s) => String(s.serverId) === serverId);
+  }
+
   res.json({
     success: true,
-    sessions: Array.from(activeStreams.values()),
-    count: activeStreams.size
+    sessions,
+    count: sessions.length,
+  });
+});
+
+app.post("/api/webrtc/start-stream", (req, res) => {
+  const { serverId, playerId, streamId } = req.body || {};
+
+  if (!serverId || !playerId) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing serverId or playerId",
+    });
+  }
+
+  const serverSocket = fivemServers.get(String(serverId));
+  if (!serverSocket) {
+    return res.status(404).json({
+      success: false,
+      error: "FiveM server not connected",
+    });
+  }
+
+  const finalStreamId =
+    streamId || `stream_${String(playerId)}_${Date.now()}`;
+
+  log("HTTP start-stream -> FiveM", { serverId, playerId, streamId: finalStreamId });
+
+  serverSocket.emit("webrtc:start_stream_request", {
+    serverId: String(serverId),
+    playerId: String(playerId),
+    streamId: finalStreamId,
+    iceServers: [],
+  });
+
+  return res.json({
+    success: true,
+    streamId: finalStreamId,
+    message: "Stream start request sent",
+  });
+});
+
+app.post("/api/webrtc/offer", (req, res) => {
+  const { serverId, playerId, streamId, offer } = req.body || {};
+
+  if (!serverId || !playerId || !streamId || !offer) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing required fields",
+    });
+  }
+
+  const serverSocket = fivemServers.get(String(serverId));
+  if (!serverSocket) {
+    return res.status(404).json({
+      success: false,
+      error: "FiveM server not connected",
+    });
+  }
+
+  log("HTTP offer -> FiveM", { serverId, playerId, streamId });
+
+  serverSocket.emit("webrtc:offer", {
+    serverId: String(serverId),
+    playerId: String(playerId),
+    streamId: String(streamId),
+    offer,
+  });
+
+  return res.json({
+    success: true,
+    message: "Offer forwarded to FiveM server",
+  });
+});
+
+app.post("/api/webrtc/ice-candidate-remote", (req, res) => {
+  const { serverId, playerId, streamId, candidate } = req.body || {};
+
+  if (!serverId || !playerId || !streamId || !candidate) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing required fields",
+    });
+  }
+
+  const serverSocket = fivemServers.get(String(serverId));
+  if (!serverSocket) {
+    return res.status(404).json({
+      success: false,
+      error: "FiveM server not connected",
+    });
+  }
+
+  serverSocket.emit("webrtc:ice_candidate_remote", {
+    serverId: String(serverId),
+    playerId: String(playerId),
+    streamId: String(streamId),
+    candidate,
+  });
+
+  return res.json({
+    success: true,
+    message: "ICE candidate forwarded to FiveM server",
   });
 });
 
@@ -48,9 +159,9 @@ app.get("/sessions", (_req, res) => {
 const io = new Server(httpServer, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST"],
   },
-  transports: ["websocket", "polling"]
+  transports: ["websocket", "polling"],
 });
 
 // -----------------------------
@@ -59,19 +170,19 @@ const io = new Server(httpServer, {
 const serverApp = io.of("/server-app");
 
 serverApp.on("connection", (socket) => {
-  const { licenseKey, version, clientType, serverId, serverName } = socket.handshake.query;
+  const { licenseKey, version, clientType, serverId, serverName } =
+    socket.handshake.query || {};
 
-  console.log("[server-app] connected", {
-    id: socket.id,
-    licenseKey,
-    version,
+  log("server-app connected", {
+    socketId: socket.id,
     clientType,
     serverId,
-    serverName
+    serverName,
+    version,
   });
 
   if (clientType !== "WaveShield_Server") {
-    console.log("[server-app] invalid client type");
+    log("invalid clientType, disconnecting");
     socket.disconnect(true);
     return;
   }
@@ -86,21 +197,22 @@ serverApp.on("connection", (socket) => {
 
   socket.emit("authenticated", {
     success: true,
-    serverId: finalServerId
+    serverId: finalServerId,
   });
 
-  // ========== FiveM -> Web ==========
+  // FiveM -> website
   socket.on("webrtc:answer", (data) => {
+    log("answer from FiveM", data?.streamId);
     io.emit("webrtc:answer", {
       ...data,
-      serverId: finalServerId
+      serverId: finalServerId,
     });
   });
 
   socket.on("webrtc:ice_candidate", (data) => {
     io.emit("webrtc:ice_candidate", {
       ...data,
-      serverId: finalServerId
+      serverId: finalServerId,
     });
   });
 
@@ -111,11 +223,11 @@ serverApp.on("connection", (socket) => {
       playerName: data.playerName || `Player ${data.playerId}`,
       serverId: finalServerId,
       serverName: finalServerName,
-      startTime: data.startTime || Date.now()
+      startTime: data.startTime || Date.now(),
     };
 
     activeStreams.set(stream.streamId, stream);
-
+    log("stream_started from FiveM", stream);
     io.emit("stream:started", stream);
   });
 
@@ -125,14 +237,16 @@ serverApp.on("connection", (socket) => {
       activeStreams.delete(streamId);
     }
 
+    log("stream_stopped from FiveM", data);
+
     io.emit("stream:stopped", {
       ...data,
-      serverId: finalServerId
+      serverId: finalServerId,
     });
   });
 
   socket.on("disconnect", (reason) => {
-    console.log("[server-app] disconnected", finalServerId, reason);
+    log("server-app disconnected", finalServerId, reason);
 
     fivemServers.delete(finalServerId);
 
@@ -144,7 +258,7 @@ serverApp.on("connection", (socket) => {
           playerId: session.playerId,
           playerName: session.playerName,
           serverId: finalServerId,
-          reason: "server_disconnected"
+          reason: "server_disconnected",
         });
       }
     }
@@ -155,67 +269,50 @@ serverApp.on("connection", (socket) => {
 // Root namespace for website
 // -----------------------------
 io.on("connection", (socket) => {
-  console.log("[web] connected", socket.id);
+  log("web connected", socket.id);
 
   socket.on("webrtc:subscribe", () => {
-    console.log("[web] subscribed", socket.id);
+    log("web subscribed", socket.id);
   });
 
   socket.on("webrtc:unsubscribe", () => {
-    console.log("[web] unsubscribed", socket.id);
+    log("web unsubscribed", socket.id);
   });
 
-  // Web -> FiveM
+  // optional direct socket path from website if you use it later
   socket.on("webrtc:offer", (data) => {
-    const { serverId } = data;
-    const serverSocket = fivemServers.get(String(serverId));
-    if (!serverSocket) {
-      console.log("[web] no FiveM server found for offer", serverId);
-      return;
-    }
-
+    const serverSocket = fivemServers.get(String(data.serverId));
+    if (!serverSocket) return;
     serverSocket.emit("webrtc:offer", data);
   });
 
   socket.on("webrtc:ice_candidate_remote", (data) => {
-    const { serverId } = data;
-    const serverSocket = fivemServers.get(String(serverId));
-    if (!serverSocket) {
-      console.log("[web] no FiveM server found for remote ICE", serverId);
-      return;
-    }
-
+    const serverSocket = fivemServers.get(String(data.serverId));
+    if (!serverSocket) return;
     serverSocket.emit("webrtc:ice_candidate_remote", data);
   });
 
   socket.on("webrtc:start_stream_request", (data) => {
-    const { serverId } = data;
-    const serverSocket = fivemServers.get(String(serverId));
-    if (!serverSocket) {
-      console.log("[web] no FiveM server found for start stream", serverId);
-      return;
-    }
-
+    const serverSocket = fivemServers.get(String(data.serverId));
+    if (!serverSocket) return;
     serverSocket.emit("webrtc:start_stream_request", data);
   });
 
   socket.on("webrtc:stop_stream", (data) => {
-    const { serverId } = data;
-    const serverSocket = fivemServers.get(String(serverId));
-    if (!serverSocket) {
-      console.log("[web] no FiveM server found for stop stream", serverId);
-      return;
-    }
-
+    const serverSocket = fivemServers.get(String(data.serverId));
+    if (!serverSocket) return;
     serverSocket.emit("webrtc:stop_stream", data);
   });
 
   socket.on("disconnect", (reason) => {
-    console.log("[web] disconnected", socket.id, reason);
+    log("web disconnected", socket.id, reason);
   });
 });
 
+// =============================
+// Boot
+// =============================
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
-  console.log(`Lunix WebRTC Signal running on port ${PORT}`);
+  log(`Lunix WebRTC Signal running on port ${PORT}`);
 });
